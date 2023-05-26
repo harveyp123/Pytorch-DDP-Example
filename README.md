@@ -1,0 +1,1 @@
+A minimum example
