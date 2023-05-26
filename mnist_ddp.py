@@ -6,17 +6,9 @@ from torchvision import datasets, transforms
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import os
+from torch.cuda.amp import custom_fwd, custom_bwd
+import torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook as powerSGD
 
-def update_loaders(train_loader, test_loader):
-    train_loader.num_workers = 0
-    test_loader.num_workers = 0
-
-def shutdown(gpu, model, process_group=None):
-    # Clear DistributedDataParallel caching and destroy the process group
-    torch.distributed.destroy_process_group(process_group)
-    model.cuda(gpu)
-    model.cpu()
-    print(f"GPU {gpu}: cleanup done.")
 def accuracy(output, target, topk=(1,5)):
     with torch.no_grad():
         maxk = max(topk)
@@ -64,34 +56,39 @@ class Net(nn.Module):
 
 
 
+#### Refer to https://pytorch.org/docs/stable/_modules/torch/distributed/algorithms/ddp_comm_hooks/default_hooks.html#fp16_compress_hook
 
-from torch.cuda.amp import custom_fwd, custom_bwd
-#### Gradient compression
-class GradientCompressionOptimizer:
-    def __init__(self, optimizer, compression='float16'):
-        self.optimizer = optimizer
-        self.compression = compression
+def fp16_compress_hook(
+    process_group: dist.ProcessGroup, bucket: dist.GradBucket
+) -> torch.futures.Future[torch.Tensor]:
+    """
+    This DDP communication hook implements a simple gradient compression
+    approach that casts ``GradBucket`` tensor to half-precision floating-point format (``torch.float16``)
+    and then divides it by the process group size.
+    It allreduces those ``float16`` gradient tensors. Once compressed gradient
+    tensors are allreduced, the chained callback ``decompress`` casts it back to the input data type (such as ``float32``).
 
-    def zero_grad(self):
-        self.optimizer.zero_grad()
+    Example::
+        >>> # xdoctest: +SKIP
+        >>> ddp_model.register_comm_hook(process_group, fp16_compress_hook)
+    """
+    group_to_use = process_group if process_group is not None else dist.group.WORLD
+    world_size = group_to_use.size()
 
-    def step(self):
-        for group in self.optimizer.param_groups:
-            for param in group['params']:
-                if param.grad is None or not param.requires_grad:
-                    continue
-                original_dtype = param.grad.data.dtype
-                with torch.cuda.amp.autocast(enabled=self.compression != 'none'):
-                    param.grad.data = param.grad.data.to(dtype=getattr(torch, self.compression))    # Compress gradients
-                param.grad.data = param.grad.data.to(dtype=original_dtype)    # Add this line to convert back to original datatype
+    compressed_tensor = bucket.buffer().to(torch.float16).div_(world_size)
 
-        self.optimizer.step()
-    
-    def state_dict(self):
-        return self.optimizer.state_dict()
+    fut = dist.all_reduce(
+        compressed_tensor, group=group_to_use, async_op=True
+    ).get_future()
 
-    def load_state_dict(self, state_dict):
-        self.optimizer.load_state_dict(state_dict)
+    def decompress(fut):
+        decompressed_tensor = bucket.buffer()
+        # Decompress in place to reduce the peak memory.
+        # See: https://github.com/pytorch/pytorch/issues/45968
+        decompressed_tensor.copy_(fut.value()[0])
+        return decompressed_tensor
+
+    return fut.then(decompress)
 
 def train(gpu, args):
     torch.cuda.set_device(gpu)
@@ -103,6 +100,42 @@ def train(gpu, args):
     torch.backends.cudnn.benchmark = True
     model = nn.parallel.DistributedDataParallel(model, device_ids=[gpu], output_device=gpu)
 
+
+####### Refer to tutorial in https://pytorch.org/docs/stable/ddp_comm_hooks.html for gradient compression #######
+
+    if args.compression != 'none':
+        if args.compression == 'fp16':
+            ##### Option 1, fp16 gradient compression
+            # model.register_comm_hook(state=None, hook=fp16_compress_hook) 
+            model.register_comm_hook(state=None, hook=torch.distributed.algorithms.ddp_comm_hooks.default_hooks.fp16_compress_hook) 
+
+        if args.compression == 'powersgd':
+            #### Option 2, PowerSGD gradient compression
+            state = powerSGD.PowerSGDState(
+            process_group=None, 
+            matrix_approximation_rank=2,
+            start_powerSGD_iter=1_000,
+            )
+            model.register_comm_hook(state, powerSGD.powerSGD_hook)
+
+        if args.compression == 'powersgd_fp16':
+            #### Option 3, PowerSGD + fp16 gradient compression
+            state = powerSGD.PowerSGDState(
+            process_group=None, 
+            matrix_approximation_rank=2,
+            start_powerSGD_iter=1_000,
+            )
+            model.register_comm_hook(state, torch.distributed.algorithms.ddp_comm_hooks.default_hooks.fp16_compress_wrapper(powerSGD.powerSGD_hook))
+
+        if args.compression == 'batched_powersgd_fp16':
+            #### Option 4, BatchedPowerSGD + fp16 gradient compression
+            state = powerSGD.PowerSGDState(
+            process_group=None, 
+            matrix_approximation_rank=2,
+            start_powerSGD_iter=1_000,
+            )
+            model.register_comm_hook(state, torch.distributed.algorithms.ddp_comm_hooks.default_hooks.fp16_compress_wrapper(powerSGD.batched_powerSGD_hook))  
+    
     transform = transforms.Compose(
         [transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))])
@@ -134,8 +167,8 @@ def train(gpu, args):
         sampler=test_sampler  # Pass the custom sampler here
     )
     criterion = nn.CrossEntropyLoss().cuda(gpu)
-    base_optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
-    optimizer = GradientCompressionOptimizer(base_optimizer, compression='float16')  # Use fp16 or bf16 to compress gradients
+    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+
     
     for epoch in range(args.epochs):
         ###### Training ######
@@ -172,16 +205,17 @@ def train(gpu, args):
         test_loss = 0.0
         correct_top1 = 0
         correct_top5 = 0
-
+        total_item = 0
         with torch.no_grad():
             for batch_idx, (data, target) in enumerate(test_loader):
                 data, target = data.to(gpu), target.to(gpu)
                 output = model(data)
                 loss = criterion(output, target)
-                test_loss += loss.item()
+                test_loss += loss.item() * target.size(0)
                 acc1, acc5 = accuracy(output, target, topk=(1, 5))
-                correct_top1 += acc1.item()
-                correct_top5 += acc5.item()
+                total_item += target.size(0)
+                correct_top1 += acc1.item() * target.size(0)
+                correct_top5 += acc5.item() * target.size(0)
 
                 loss = loss
                 acc1 = acc1.data.clone()
@@ -191,15 +225,18 @@ def train(gpu, args):
                 dist.reduce(acc5, dst=0)
                 if gpu == 0:
                     if batch_idx % args.log_interval == 0:
-                        reduced_loss /= nums_gpus
-                        reduced_correct_top1 /= nums_gpus
-                        reduced_correct_top5 /= nums_gpus
+                        loss /= nums_gpus
+                        acc1 /= nums_gpus
+                        acc5 /= nums_gpus
                         print(f"Test Epoch: {epoch} [{batch_idx}/{len(test_loader)}\t"
                             f"({100.0 * batch_idx / len(test_loader):.0f}%)]\t"
                             f"Loss: {loss.item():.6f}\t"
                             f"Top 1 Acc: {acc1.item():.2f}%\t"
                             f"Top 5 Acc: {acc5.item():.2f}%")
 
+        correct_top1 = correct_top1/total_item
+        correct_top5 = correct_top5/total_item
+        test_loss = test_loss/total_item
         reduced_test_loss = torch.tensor(test_loss, dtype=torch.float, device=gpu)
         reduced_correct_top1 = torch.tensor(correct_top1, dtype=torch.float, device=gpu)
         reduced_correct_top5 = torch.tensor(correct_top5, dtype=torch.float, device=gpu)
@@ -209,9 +246,9 @@ def train(gpu, args):
 
         if gpu == 0:
             num_gpus = torch.cuda.device_count()
-            reduced_test_loss /= num_gpus * len(test_loader.dataset)
-            reduced_correct_top1 = 100.0 * reduced_correct_top1.item() / len(test_loader.dataset)
-            reduced_correct_top5 = 100.0 * reduced_correct_top5.item() / len(test_loader.dataset)
+            reduced_test_loss /= num_gpus #* len(test_loader.dataset)
+            reduced_correct_top1 = reduced_correct_top1.item() / num_gpus
+            reduced_correct_top5 = reduced_correct_top5.item() / num_gpus
             print(f"\nTest Epoch: {epoch}: Average loss: {reduced_test_loss:.4f}, "
                     f"Top 1 Acc: {reduced_correct_top1:.2f}%, "
                     f"Top 5 Acc: {reduced_correct_top5:.2f}%\n")
@@ -224,6 +261,8 @@ def main():
     parser.add_argument('--lr', type=float, default=0.01)
     parser.add_argument('--momentum', type=float, default=0.5)
     parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--compression', type=str, default='none', \
+                        choices=['none', 'fp16', 'powersgd', 'powersgd_fp16', 'batched_powersgd_fp16'])
     parser.add_argument('--log_interval', type=int, default=10)
     args = parser.parse_args()
 

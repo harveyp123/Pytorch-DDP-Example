@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=4,5,6,7 python mnist_ddp.py
+CUDA_VISIBLE_DEVICES=4,5,6,7 python mnist_ddp.py --compression powersgd_fp16
