@@ -1,4 +1,4 @@
-A minimum example for pytorch DDP based single node multi-GPU usage on MNIST dataset
+A minimum example for pytorch DDP based single node multi-GPU usage on MNIST dataset. This example includes basic DDP usage, gradient compression, and additional handling. 
 
 ## 1. Environment setup
 Create a environment with pytorch in it
