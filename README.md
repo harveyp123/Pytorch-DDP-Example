@@ -21,7 +21,7 @@ Details can be found later section.
 ## 3. Important explanation of code
 
 ### 3.1 SyncBN
-The batchnorm in the model will be transformed into synchronous batch norm ([SyncBN](https://pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html)) at line 99:
+The batchnorm in the model will be transformed into synchronous batch norm ([SyncBN](https://pytorch.org/docs/stable/generated/torch.nn.SyncBatchNorm.html)):
 
 ```py
 model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -31,7 +31,7 @@ The running mean and variance in the batch norm is not pytorch parameter object 
 With SyncBatchNorm, the running mean and variance will be shared among multiple GPUs, and the effective batch size will be (single GPU batch size * number of GPUs)
 
 ### 3.2 Gradient compression for communication reduction
-Line 106 to 137 defines the 4 types of gradient compression. The tutorial can be found in official [Pytorch](https://pytorch.org/docs/stable/ddp_comm_hooks.html) document or [Medium](https://medium.com/pytorch/accelerating-pytorch-ddp-by-10x-with-powersgd-585aef12881d). 
+We have 4 types of gradient compression. The tutorial can be found in official [Pytorch](https://pytorch.org/docs/stable/ddp_comm_hooks.html) document or [Medium](https://medium.com/pytorch/accelerating-pytorch-ddp-by-10x-with-powersgd-585aef12881d). 
 
 #### Method 1, FP16 gradient compression: 
 ```py
@@ -75,24 +75,45 @@ The batched_powerSGD_hook flattenes all gradient tensors and conduct compression
 ## 4 More code details explanation
 
 ### 4.1 Accuracy
-Line 12 to 25 defines the function for calculating top-1 and top-5 accuracy
+This defines the function for calculating top-1 and top-5 accuracy
 ```py
 def accuracy(output, target, topk=(1,5)):
 ```
 
 ### 4.2 Model
-Line 28 to 55 defines the function for model
+This defines the function for model
 ```py
 class Net(nn.Module):
 ```
 
-### 4.3 Distributed communication package
-Line 96 defines the communication backend and protocol. 
+### 4.3. Logger:
+```py
+logger = get_logger(os.path.join(args.path, "mnist_train.log"))
+```
+This set the logger output path, by default ```args.path``` is ```./logging/```
+
+### 4.4 Distributed communication package
+This defines the communication backend and protocol. 
 ```py
 torch.distributed.init_process_group(backend="nccl", init_method="tcp://localhost:12345", world_size=nums_gpus, rank=gpu) 
 ```
 Detailed can be found in [Pytorch](https://pytorch.org/docs/stable/distributed.html) official document, which compares difference between ```gloo, mpi, nccl``` communication backend. 
 
-### 4.4 Keyboard interrupt handling
-Line 277 to 290 defines the handler for keyboard interrupt. Upon the keyboard interrupt received, all process will be terminated and joined. It ensures the correct keyboard interrupt behavior, otherwise some process will be dangling on system and requires manual kill. 
+### 4.5 Keyboard interrupt handling
+This defines the handler for keyboard interrupt. Upon the keyboard interrupt received, all process will be terminated and joined. It ensures the correct keyboard interrupt behavior, otherwise some process will be dangling on system and requires manual kill. 
+```py
+try:
+    for gpu in range(num_gpus):
+        p = Process(target=train, args=(gpu, args, barrier))
+        p.start()
+        processes.append(p)
 
+    for p in processes:
+        p.join()
+
+except KeyboardInterrupt:
+    print("KeyboardInterrupt received. Terminating processes...")
+    for p in processes:
+        p.terminate()
+        p.join()
+```
