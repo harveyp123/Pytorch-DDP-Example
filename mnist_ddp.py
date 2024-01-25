@@ -180,6 +180,8 @@ def train(gpu, args, barrier):
 
 
     barrier.wait()
+    # Or 
+    # torch.distributed.barrier()
     if gpu != 0:
         train_dataset = datasets.MNIST('./data', train=True, download=False, transform=transform)
         test_dataset = datasets.MNIST('./data', train=False, transform=transform)
